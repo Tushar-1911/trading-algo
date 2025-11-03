@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
 from logger import logger
+from analytics.volatility import VolatilityPredictor
 
 class SurvivorStrategy:
     """
@@ -91,8 +92,13 @@ class SurvivorStrategy:
             logger.error(f"Instument {self.symbol_initials} not found. Please check the symbol initials")
             return
         
-        self.strike_difference = None      
+        self.strike_difference = None
         self._initialize_state()
+
+        # Initialize the volatility predictor
+        self.volatility_predictor = VolatilityPredictor(period=20)
+        self.dynamic_pe_gap = self.strat_var_pe_gap
+        self.dynamic_ce_gap = self.strat_var_ce_gap
         
         # Calculate and store strike difference for the option series
         self.strike_difference = self._get_strike_difference(self.symbol_initials)
@@ -171,6 +177,12 @@ class SurvivorStrategy:
         """
         current_price = ticks['last_price']
         
+        # Update the volatility predictor with the latest price
+        self.volatility_predictor.update(current_price)
+
+        # Update the dynamic gaps based on the latest volatility
+        self._update_dynamic_gaps()
+
         # Process trading opportunities for both sides
         self._handle_pe_trade(current_price)  # Handle Put option opportunities
         self._handle_ce_trade(current_price)  # Handle Call option opportunities
@@ -228,9 +240,9 @@ class SurvivorStrategy:
 
         # Calculate price difference and check if it exceeds gap threshold
         price_diff = round(current_price - self.nifty_pe_last_value, 0)
-        if price_diff > self.strat_var_pe_gap:
+        if price_diff > self.dynamic_pe_gap:
             # Calculate multiplier for position sizing
-            sell_multiplier = int(price_diff / self.strat_var_pe_gap)
+            sell_multiplier = int(price_diff / self.dynamic_pe_gap)
             
             # Risk check: Ensure multiplier doesn't exceed threshold
             if self._check_sell_multiplier_breach(sell_multiplier):
@@ -238,7 +250,7 @@ class SurvivorStrategy:
                 return
 
             # Update reference value based on executed gaps
-            self.nifty_pe_last_value += self.strat_var_pe_gap * sell_multiplier
+            self.nifty_pe_last_value += self.dynamic_pe_gap * sell_multiplier
             
             # Calculate total quantity to trade
             total_quantity = sell_multiplier * self.strat_var_pe_quantity
@@ -302,9 +314,9 @@ class SurvivorStrategy:
 
         # Calculate price difference and check if it exceeds gap threshold
         price_diff = round(self.nifty_ce_last_value - current_price, 0)  
-        if price_diff > self.strat_var_ce_gap:
+        if price_diff > self.dynamic_ce_gap:
             # Calculate multiplier for position sizing
-            sell_multiplier = int(price_diff / self.strat_var_ce_gap)
+            sell_multiplier = int(price_diff / self.dynamic_ce_gap)
             
             # Risk check: Ensure multiplier doesn't exceed threshold
             if self._check_sell_multiplier_breach(sell_multiplier):
@@ -312,7 +324,7 @@ class SurvivorStrategy:
                 return
 
             # Update reference value based on executed gaps
-            self.nifty_ce_last_value -= self.strat_var_ce_gap * sell_multiplier
+            self.nifty_ce_last_value -= self.dynamic_ce_gap * sell_multiplier
             
             # Calculate total quantity to trade
             total_quantity = sell_multiplier * self.strat_var_ce_quantity
@@ -559,6 +571,21 @@ class SurvivorStrategy:
             f"CE Gap = {self.strat_var_ce_gap}, "
             f"PE Gap = {self.strat_var_pe_gap}"
         )
+
+    def _update_dynamic_gaps(self):
+        """
+        Updates the pe_gap and ce_gap based on market volatility.
+        """
+        volatility = self.volatility_predictor.get_volatility()
+
+        # Simple non-linear adjustment factor
+        adjustment_factor = 1.0 + 2.0 * volatility
+
+        self.dynamic_pe_gap = self.strat_var_pe_gap * adjustment_factor
+        self.dynamic_ce_gap = self.strat_var_ce_gap * adjustment_factor
+
+        logger.debug(f"Volatility: {volatility:.4f}, Adjustment Factor: {adjustment_factor:.2f}")
+        logger.debug(f"Dynamic Gaps -> PE: {self.dynamic_pe_gap:.2f}, CE: {self.dynamic_ce_gap:.2f}")
 
 
 # Below Logic is for
