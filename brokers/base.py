@@ -18,6 +18,12 @@ class BrokerBase:
         """
         raise NotImplementedError("Subclasses must implement authenticate()")
 
+    def subscribe(self, symbols: List[Any]):
+        """
+        Subscribe to market data for the given symbols.
+        """
+        pass
+
     def list_functions(self) -> List[str]:
         """
         List available public methods (excluding private and base methods).

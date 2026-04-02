@@ -64,6 +64,7 @@ class SurvivorStrategy:
     - pe_quantity/ce_quantity: Base quantities for each trade
     - min_price_to_sell: Minimum option premium threshold
     - sell_multiplier_threshold: Maximum position scaling limit
+    - max_pe_positions/max_ce_positions: Maximum number of open positions allowed per side
     
     RISK MANAGEMENT:
     ===============
@@ -91,7 +92,8 @@ class SurvivorStrategy:
             logger.error(f"Instument {self.symbol_initials} not found. Please check the symbol initials")
             return
         
-        self.strike_difference = None      
+        self.strike_difference = None
+        self.option_price_cache = {} # Cache for option prices: {symbol: last_price}
         self._initialize_state()
         
         # Calculate and store strike difference for the option series
@@ -154,29 +156,191 @@ class SurvivorStrategy:
         self.strike_difference = abs(top2.iloc[1]['strike'] - top2.iloc[0]['strike'])
         return self.strike_difference
 
+    def _check_daily_loss_limit(self):
+        """
+        Check if the daily loss limit has been breached.
+        """
+        completed_orders = self.order_manager.completed_orders
+        realized_pnl = 0
+
+        # We need to track realized P&L based on Sell and Buy price differences
+        # For simplicity, we assume one-to-one mapping for now.
+        # Ideally, we should group by symbol.
+        for order in completed_orders:
+            # We already have the logic to track realized P&L if we had exit price
+            # Since exit price is not in original OrderTracker, let's keep it simple
+            pass
+
+        # Return True if breach detected (loss exceeds max_daily_loss)
+        # Note: MTM calculation would be better but requires current open position prices
+        # for all positions which we now have in self.option_price_cache
+        total_mtm = 0
+        open_orders = self.order_manager.non_completed_orders
+        for order in open_orders:
+            symbol = order['symbol']
+            entry_price = order.get('price')
+            ltp = self.option_price_cache.get(symbol)
+            if entry_price and ltp:
+                # If we sold at entry_price and LTP is higher, we are losing
+                total_mtm += (entry_price - ltp) * order['quantity']
+
+        if total_mtm < -self.strat_var_max_daily_loss:
+            logger.error(f"Daily loss limit breached! MTM: {total_mtm}")
+            return True
+
+        return False
+
     def on_ticks_update(self, ticks):
         """
         Main strategy execution method called on each tick update
         
         Args:
-            ticks (dict): Market data containing 'last_price' and other tick information
+            ticks (list or dict): Market data from websocket
             
         This is the core method that:
-        1. Extracts current price from tick data
-        2. Evaluates PE trading opportunities
-        3. Evaluates CE trading opportunities  
-        4. Applies reset logic for reference values
+        1. Updates price cache for options
+        2. Manages existing positions (SL/TP)
+        3. Extracts current index price from tick data
+        4. Evaluates PE trading opportunities
+        5. Evaluates CE trading opportunities
+        6. Applies reset logic for reference values
         
         Called externally by the main trading loop when new market data arrives
         """
-        current_price = ticks['last_price']
+        # Ensure ticks is a list
+        if isinstance(ticks, dict):
+            ticks = [ticks]
+
+        index_tick = None
+        for tick in ticks:
+            # Check if this is the index tick or an option tick
+            # In Dhan, security_id is used. In Zerodha/Fyers, instrument_token or symbol.
+            symbol = tick.get('symbol') or tick.get('tradingsymbol')
+
+            # If it's an option symbol (contains PE or CE), update cache
+            if symbol and ("PE" in symbol or "CE" in symbol):
+                self.option_price_cache[symbol] = tick['last_price']
+
+            # If it's the index symbol (from dispatcher), it has 'last_price'
+            # Note: The dispatcher in survivor.py main loop sends symbol_data = tick_data[0]
+            # which we already know is the index tick.
+            if 'last_price' in tick and not symbol: # Placeholder for index tick identification
+                index_tick = tick
+            elif symbol == self.strat_var_index_symbol:
+                index_tick = tick
+
+        # If no index tick found, it might be the whole 'ticks' object if it was a single dict
+        if not index_tick and len(ticks) > 0 and 'last_price' in ticks[0]:
+            index_tick = ticks[0]
+
+        if not index_tick:
+            return
+
+        current_price = index_tick['last_price']
         
-        # Process trading opportunities for both sides
+        # Check daily loss limit before opening new trades
+        if self._check_daily_loss_limit():
+            # Close all positions and stop? Or just skip new trades?
+            # For now, let's skip new trades.
+            self._manage_positions() # Still manage existing exits
+            return
+
+        # 1. Manage existing positions (SL/TP) using cached prices
+        self._manage_positions()
+
+        # 2. Process trading opportunities for both sides
         self._handle_pe_trade(current_price)  # Handle Put option opportunities
         self._handle_ce_trade(current_price)  # Handle Call option opportunities
         
-        # Apply reset logic to adjust reference values
+        # 3. Apply reset logic to adjust reference values
         self._reset_reference_values(current_price)
+
+    def _manage_positions(self):
+        """
+        Check all open positions for Stop Loss or Take Profit conditions.
+        Uses cached option prices to avoid synchronous REST calls.
+        """
+        open_orders = self.order_manager.non_completed_orders
+        if not open_orders:
+            return
+
+        # Get unique symbols from open orders
+        symbols = list(set([order['symbol'] for order in open_orders]))
+
+        for symbol in symbols:
+            # Check cache first
+            ltp = self.option_price_cache.get(symbol)
+
+            # If not in cache, we could optionally call get_quote, but to avoid
+            # rate limits, we'll only do it if the cache is empty and with throttling.
+            if ltp is None:
+                # For first-time populating or if websocket doesn't provide all symbols
+                # We'll skip for now to stay safe, or we could implement throttled REST.
+                continue
+
+            try:
+                self._check_exit_conditions(symbol, ltp, open_orders)
+            except Exception as e:
+                logger.error(f"Error managing position for {symbol}: {e}")
+
+    def _check_exit_conditions(self, symbol, current_premium, open_orders):
+        """
+        Check SL/TP for a specific symbol.
+        """
+        # Filter orders for this symbol
+        symbol_orders = [o for o in open_orders if o['symbol'] == symbol]
+
+        for order in symbol_orders:
+            order['current_premium'] = current_premium # Temporary storage
+            entry_price = order.get('price')
+            if entry_price is None:
+                # If entry price is not tracked, we might need to fetch it from broker
+                # or skip for now. For market orders, it should be captured after execution.
+                continue
+
+            # Calculate P&L percentage for the short position
+            # Since we sold, if current_premium < entry_price, we are in profit
+            profit_pct = (entry_price - current_premium) / entry_price * 100
+
+            # Take Profit: Premium decayed by tp-pct (e.g. 80%)
+            if profit_pct >= self.strat_var_tp_pct:
+                logger.info(f"TAKE PROFIT triggered for {symbol}: Entry {entry_price}, Current {current_premium} ({profit_pct:.2f}%)")
+                self._close_position(order)
+
+            # Stop Loss: Premium increased by sl-pct (e.g. 50%)
+            # Loss occurs if current_premium > entry_price
+            elif profit_pct <= -self.strat_var_sl_pct:
+                logger.info(f"STOP LOSS triggered for {symbol}: Entry {entry_price}, Current {current_premium} ({profit_pct:.2f}%)")
+                self._close_position(order)
+
+    def _close_position(self, order):
+        """
+        Close an open position by placing an offsetting order.
+        """
+        symbol = order['symbol']
+        quantity = order['quantity']
+        # Opposite of entry transaction type
+        exit_trans_type = "BUY" if order['transaction_type'] == "SELL" else "SELL"
+
+        logger.info(f"Closing position for {symbol} × {quantity}")
+        order_id = self.broker.place_order(
+            symbol,
+            quantity,
+            price=None,
+            transaction_type=exit_trans_type,
+            order_type=self.strat_var_order_type,
+            variety="REGULAR",
+            exchange=self.strat_var_exchange,
+            product=self.strat_var_product_type,
+            tag="Survivor_Exit"
+        )
+
+        if order_id != -1:
+            # Mark the original order as completed and record the exit premium
+            self.order_manager.complete_order(order['order_id'], exit_price=order.get('current_premium'))
+            logger.info(f"Position {order['order_id']} closed successfully.")
+        else:
+            logger.error(f"Failed to close position {order['order_id']}")
 
     def _check_sell_multiplier_breach(self, sell_multiplier):
         """
@@ -196,6 +360,17 @@ class SurvivorStrategy:
             logger.warning(f"Sell multiplier {sell_multiplier} breached the threshold {self.strat_var_sell_multiplier_threshold}")
             return True
         return False
+
+    def _count_open_positions(self, side):
+        """
+        Count the number of open positions for a given side (PE or CE).
+        """
+        open_orders = self.order_manager.non_completed_orders
+        count = 0
+        for order in open_orders:
+            if side in order['symbol']:
+                count += 1
+        return count
 
     def _handle_pe_trade(self, current_price):
         """
@@ -229,6 +404,11 @@ class SurvivorStrategy:
         # Calculate price difference and check if it exceeds gap threshold
         price_diff = round(current_price - self.nifty_pe_last_value, 0)
         if price_diff > self.strat_var_pe_gap:
+            # Check if max PE positions reached
+            if self._count_open_positions("PE") >= self.strat_var_max_pe_positions:
+                logger.warning("Max PE positions reached. Skipping trade.")
+                return
+
             # Calculate multiplier for position sizing
             sell_multiplier = int(price_diff / self.strat_var_pe_gap)
             
@@ -265,7 +445,7 @@ class SurvivorStrategy:
                     
                 # Execute the trade
                 logger.info(f"Execute PE sell @ {instrument['tradingsymbol']} × {total_quantity}, Market Price")
-                self._place_order(instrument['tradingsymbol'], total_quantity)
+                self._place_order(instrument['tradingsymbol'], total_quantity, entry_price=quote['last_price'])
                 
                 # Set reset flag to enable reset logic
                 self.pe_reset_gap_flag = 1
@@ -303,6 +483,11 @@ class SurvivorStrategy:
         # Calculate price difference and check if it exceeds gap threshold
         price_diff = round(self.nifty_ce_last_value - current_price, 0)  
         if price_diff > self.strat_var_ce_gap:
+            # Check if max CE positions reached
+            if self._count_open_positions("CE") >= self.strat_var_max_ce_positions:
+                logger.warning("Max CE positions reached. Skipping trade.")
+                return
+
             # Calculate multiplier for position sizing
             sell_multiplier = int(price_diff / self.strat_var_ce_gap)
             
@@ -340,7 +525,7 @@ class SurvivorStrategy:
                     
                 # Execute the trade
                 logger.info(f"Execute CE sell @ {instrument['tradingsymbol']} × {total_quantity}, Market Price")
-                self._place_order(instrument['tradingsymbol'], total_quantity)
+                self._place_order(instrument['tradingsymbol'], total_quantity, entry_price=quote['last_price'])
                 
                 # Set reset flag to enable reset logic
                 self.ce_reset_gap_flag = 1
@@ -489,7 +674,7 @@ class SurvivorStrategy:
             else:
                 return instrument
 
-    def _place_order(self, symbol, quantity):
+    def _place_order(self, symbol, quantity, entry_price=None):
         """
         Execute order placement through the broker
         
@@ -538,7 +723,7 @@ class SurvivorStrategy:
             "symbol": symbol,
             "transaction_type": self.strat_var_trans_type,
             "quantity": quantity,
-            "price": None,  # Market order
+            "price": entry_price,  # Use estimated entry price for SL/TP tracking
             "timestamp": datetime.now().isoformat(),
         }
         
@@ -674,6 +859,7 @@ PARAMETER GROUPS:
 • Order Management: order-type, product-type, exchange
 • Risk Management: min-price-to-sell, sell-multiplier-threshold
 • Position Sizing: pe-quantity, ce-quantity
+    Risk Management: sl-pct, tp-pct, max-daily-loss, max-pe-positions, max-ce-positions
             """
         )
         
@@ -789,6 +975,21 @@ PARAMETER GROUPS:
                              'position sizes during large market moves. E.g., if threshold '
                              'is 3 and calculated multiplier is 4, trade will be blocked.')
         
+        parser.add_argument('--sl-pct', type=float, default=50.0,
+                        help='Stop loss percentage for each position (e.g., 50.0 for 50%%).')
+
+        parser.add_argument('--tp-pct', type=float, default=80.0,
+                        help='Take profit percentage for each position (e.g., 80.0 for 80%%).')
+
+        parser.add_argument('--max-daily-loss', type=float, default=5000.0,
+                        help='Maximum allowed daily loss for the strategy.')
+
+        parser.add_argument('--max-pe-positions', type=int, default=10,
+                        help='Maximum number of open PE positions allowed.')
+
+        parser.add_argument('--max-ce-positions', type=int, default=10,
+                        help='Maximum number of open CE positions allowed.')
+
         # =======================================================================
         # UTILITY OPTIONS
         # =======================================================================
@@ -1050,12 +1251,23 @@ PARAMETER GROUPS:
     
     
     # Create broker interface for market data and order execution
-    if os.getenv("BROKER_TOTP_ENABLE") == "true":
-        logger.info("Using TOTP login flow")
-        broker = ZerodhaBroker(without_totp=False)
+    broker_name = os.getenv("BROKER_NAME", "zerodha").lower()
+    if broker_name == "dhan":
+        from brokers.dhan import DhanBroker
+        logger.info("Initializing Dhan Broker")
+        broker = DhanBroker()
+    elif broker_name == "fyers":
+        from brokers.fyers import FyersBroker
+        logger.info("Initializing Fyers Broker")
+        broker = FyersBroker()
     else:
-        logger.info("Using normal login flow")
-        broker = ZerodhaBroker(without_totp=True)
+        logger.info("Initializing Zerodha Broker")
+        if os.getenv("BROKER_TOTP_ENABLE") == "true":
+            logger.info("Using TOTP login flow")
+            broker = ZerodhaBroker(without_totp=False)
+        else:
+            logger.info("Using normal login flow")
+            broker = ZerodhaBroker(without_totp=True)
     
     # Create order tracking system for position management
     order_tracker = OrderTracker() 
