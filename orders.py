@@ -174,18 +174,23 @@ class OrderTracker:
         """
         return list(self._all_orders.values())
     
-    def complete_order(self, order_id: str):
+    def complete_order(self, order_id: str, exit_price: float = None):
         """
-        Marks an order as completed.
+        Marks an order as completed and optionally records the exit price.
         """
         if order_id in self._all_orders:
             if order_id not in self._order_ids_completed:
                 self._order_ids_completed.append(order_id)
+                if exit_price is not None:
+                    self._all_orders[order_id]['exit_price'] = exit_price
+
                 if self._all_orders[order_id]['transaction_type'] not in self._order_types_summary:
                     self._order_types_summary[self._all_orders[order_id]['transaction_type']] = 1
                 else:
                     self._order_types_summary[self._all_orders[order_id]['transaction_type']] += 1
-                logger.info(f"Order '{order_id}' marked as completed.")
+
+                self._save_orders()
+                logger.info(f"Order '{order_id}' marked as completed with exit price {exit_price}.")
             else:
                 logger.info(f"Order '{order_id}' already marked as completed.")
             return True
