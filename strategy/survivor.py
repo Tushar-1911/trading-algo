@@ -677,6 +677,7 @@ class SurvivorStrategy:
     def _place_order(self, symbol, quantity, entry_price=None):
         """
         Execute order placement through the broker
+        Also subscribes to the symbol for real-time price tracking (SL/TP)
         
         Args:
             symbol (str): Trading symbol for the option
@@ -715,6 +716,13 @@ class SurvivorStrategy:
             return
             
         logger.info(f"Placing order for {symbol} × {quantity}, Market Price")
+
+        # Subscribe to the option symbol for SL/TP tracking
+        try:
+            self.broker.subscribe([symbol])
+            logger.info(f"Subscribed to {symbol} for real-time SL/TP monitoring.")
+        except Exception as e:
+            logger.warning(f"Failed to subscribe to {symbol}: {e}")
         
         # Track the order using OrderTracker
         from datetime import datetime

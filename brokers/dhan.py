@@ -181,3 +181,39 @@ class DhanBroker(BrokerBase):
 
         if self.on_connect:
             self.on_connect(None, "Connected")
+
+    def subscribe(self, symbols: List[Any]):
+        """
+        Subscribe to market data for the given symbols.
+        Expects a list of symbols (strings) or security_ids (ints)
+        """
+        if not self.feed:
+            logger.warning("Market feed not initialized. Cannot subscribe.")
+            return
+
+        instruments_to_add = []
+        for sym in symbols:
+            if isinstance(sym, str):
+                # Handle exchange prefix
+                clean_sym = sym.split(':')[-1] if ':' in sym else sym
+                if self.instruments_df.empty:
+                    self.download_instruments()
+
+                row = self.instruments_df[self.instruments_df['tradingsymbol'] == clean_sym]
+                if not row.empty:
+                    security_id = int(row.iloc[0]['SEM_SMST_SECURITY_ID'])
+                    exchange_segment = int(row.iloc[0]['SEM_EXCH_ID'])
+                    instruments_to_add.append((exchange_segment, security_id))
+            elif isinstance(sym, (int, float)):
+                # Default segment to NSE_FNO for integers? (risky, but often used for security_ids)
+                # Ideally, the caller should provide the segment.
+                # Assuming F&O segment (NSE_FNO = 1)
+                instruments_to_add.append((self.dhan.NSE_FNO, int(sym)))
+
+        if instruments_to_add:
+            try:
+                # We'll use the documented subscribe_instruments from our dir() check earlier
+                self.feed.subscribe_instruments(instruments_to_add)
+                logger.info(f"Dhan subscribed to: {instruments_to_add}")
+            except Exception as e:
+                logger.error(f"Failed to subscribe on Dhan: {e}")

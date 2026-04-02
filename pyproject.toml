@@ -15,4 +15,5 @@ dependencies = [
     "ratelimit>=2.2.1",
     "requests>=2.31.0",
     "dhanhq>=2.0.2",
+    "yfinance>=0.2.37",
 ]
